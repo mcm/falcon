@@ -15,6 +15,11 @@
 from datetime import datetime
 
 try:
+    import json
+except ImportError:
+    json = None
+
+try:
     # NOTE(kgrifs): In Python 2.6 and 2.7, socket._fileobject is a
     # standard way of exposing a socket as a file-like object, and
     # is used by wsgiref for wsgi.input.
@@ -177,6 +182,7 @@ class Request(object):
         'env',
         'method',
         '_params',
+        '_form_params',
         'path',
         'query_string',
         'stream',
@@ -217,6 +223,7 @@ class Request(object):
             self.path = '/'
 
         self._params = {}
+        self._form_params = {}
 
         # PERF(kgriffs): if...in is faster than using env.get(...)
         if 'QUERY_STRING' in env:
@@ -257,8 +264,14 @@ class Request(object):
         # cycles and parse the content type for real, but
         # this heuristic will work virtually all the time.
         if (self.content_type is not None and
-                'application/x-www-form-urlencoded' in self.content_type):
-            self._parse_form_urlencoded()
+                'application/x-www-form-urlencoded' in self.content_type and
+                self.options.consume_urlencoded_post):
+            self._form_params = self.parse_form_urlencoded()
+        elif (self.content_type is not None and
+                'application/json' in self.content_type and
+                self.options.consume_json_post and
+                json is not None):
+            self._form_params = self.parse_json_body()
 
     # ------------------------------------------------------------------------
     # Properties
@@ -887,7 +900,7 @@ class Request(object):
             # but it had an invalid value.
             pass
 
-    def _parse_form_urlencoded(self):
+    def parse_form_urlencoded(self):
         # NOTE(kgriffs): This assumes self.stream has been patched
         # above in the case of wsgiref, so that self.content_length
         # is not needed. Normally we just avoid accessing
@@ -897,6 +910,12 @@ class Request(object):
         # content length will only ever be read once per
         # request in most cases.
         body = self.stream.read()
+
+        # Issue #418: If we consume the stream, replace self.stream
+        # with a StringIO of the body we consumed. This is probably
+        # not the *ideal* solution, but it is at least an improvement
+        # to the current behavior
+        self.stream = six.StringIO(body)
 
         # NOTE(kgriffs): According to http://goo.gl/6rlcux the
         # body should be US-ASCII. Enforcing this also helps
@@ -911,12 +930,34 @@ class Request(object):
                            'will be ignored.')
 
         if body:
-            extra_params = uri.parse_query_string(
+            return uri.parse_query_string(
                 body,
                 keep_blank_qs_values=self.options.keep_blank_qs_values,
             )
 
-            self._params.update(extra_params)
+    def parse_json_body(self):
+        # NOTE(kgriffs): This assumes self.stream has been patched
+        # above in the case of wsgiref, so that self.content_length
+        # is not needed. Normally we just avoid accessing
+        # self.content_length, because it is a little expensive
+        # to call. We could cache self.content_length, but the
+        # overhead to do that won't usually be helpful, since
+        # content length will only ever be read once per
+        # request in most cases.
+        body = self.stream.read()
+
+        # NOTE(mcmasterathl) If we consume the stream, replace self.stream
+        # with a StringIO of the body we consumed. This is probably
+        # not the *ideal* solution, but it is at least an improvement
+        # to the current behavior
+        self.stream = six.StringIO(body)
+
+        # NOTE(mcmasterathl) Falcon already suggests utf-8 decoding for
+        # handling JSON POST bodies
+        body = body.decode("utf-8")
+
+        if body:
+            return json.loads(body)
 
 
 # PERF: To avoid typos and improve storage space and speed over a dict.
@@ -926,11 +967,19 @@ class RequestOptions(object):
     Attributes:
         keep_blank_qs_values (bool): Set to ``True`` in order to retain
             blank values in query string parameters (default ``False``).
+        consume_urlencoded_post (bool): Set to ``True`` in order to parse
+            url-encoded form data from the body (default ``False``).
+        consume_json_post (bool): Set to ``True`` in order to parse JSON
+            POST data from the body (default ``False``).
 
     """
     __slots__ = (
         'keep_blank_qs_values',
+        'consume_urlencoded_post',
+        'consume_json_post',
     )
 
     def __init__(self):
         self.keep_blank_qs_values = False
+        self.consume_urlencoded_post = True
+        self.consume_json_post = True
